@@ -198,6 +198,22 @@ func (d *Discovery) ScanInterfaces() ([]models.NetworkInterface, error) {
 		interfaces = append(interfaces, iface)
 	}
 
+	// Clean up stale entries for unplugged interfaces
+	activeSet := make(map[string]struct{}, len(interfaces))
+	for _, inf := range interfaces {
+		activeSet[inf.Name] = struct{}{}
+	}
+	for k := range d.previousIO {
+		if _, active := activeSet[k]; !active {
+			delete(d.previousIO, k)
+		}
+	}
+	for k := range d.uptimeStart {
+		if _, active := activeSet[k]; !active {
+			delete(d.uptimeStart, k)
+		}
+	}
+
 	return interfaces, nil
 }
 

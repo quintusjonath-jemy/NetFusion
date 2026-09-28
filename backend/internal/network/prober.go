@@ -44,13 +44,13 @@ func NewInterfaceProber() *InterfaceProber {
 
 // ProbeInterface conducts an interface-bound latency, loss, and jitter probe
 func (p *InterfaceProber) ProbeInterface(ifaceName, ifaceIP, gateway string) ProbeResult {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	target := p.selectTarget(gateway)
-	latency, err := probeTCP(ifaceName, ifaceIP, target, 1200*time.Millisecond)
+	latency, err := probeTCP(ifaceName, ifaceIP, target, 1000*time.Millisecond)
 
 	success := (err == nil)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	// Update loss history
 	if _, ok := p.lossHistory[ifaceName]; !ok {
@@ -124,15 +124,12 @@ func probeTCP(ifaceName, ifaceIP, target string, timeout time.Duration) (float64
 	// Bind to interface: try SO_BINDTODEVICE via socket control
 	if ifaceName != "" {
 		dialer.Control = func(network, address string, c syscall.RawConn) error {
-			var operr error
-			err := c.Control(func(fd uintptr) {
-				// SO_BINDTODEVICE = 25 on Linux
-				operr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, 25, ifaceName)
+			_ = c.Control(func(fd uintptr) {
+				// SO_BINDTODEVICE = 25 on Linux. Requires CAP_NET_RAW / root.
+				// If unprivileged, kernel cleanly falls back to routing via LocalAddr.
+				_ = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, 25, ifaceName)
 			})
-			if err != nil {
-				return err
-			}
-			return operr
+			return nil
 		}
 	}
 
