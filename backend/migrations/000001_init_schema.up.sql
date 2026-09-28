@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS network_interfaces (
 );
 
 CREATE TABLE IF NOT EXISTS network_metrics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id BIGSERIAL PRIMARY KEY,
     interface_id TEXT NOT NULL,
     interface_name TEXT NOT NULL,
     download_mbps REAL DEFAULT 0.0,

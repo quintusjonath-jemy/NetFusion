@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"netfusion/backend/internal/config"
 	"netfusion/backend/internal/database"
+	"netfusion/backend/internal/monitor"
 )
 
 func main() {
@@ -47,12 +49,28 @@ func main() {
 
 	logger.Info("Database ready", "driver", db.Driver())
 
-	// 4. Temporary basic healthcheck server for Phase 1 verification
+	// 4. Initialize & Start Network Telemetry Monitor
+	mon := monitor.New(cfg, db, logger)
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+	mon.Start(serverCtx)
+
+	// 5. Basic healthcheck and diagnostic endpoint
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok","component":"netfusion-backend","phase":1}`))
+		mptcp := mon.GetMPTCPStatus()
+		ifaces := mon.GetInterfaces()
+		resp := fmt.Sprintf(`{
+			"status": "ok",
+			"component": "netfusion-backend",
+			"phase": 2,
+			"simulationMode": %v,
+			"interfacesCount": %d,
+			"mptcpEnabled": %v
+		}`, mon.IsSimulationMode(), len(ifaces), mptcp.Enabled)
+		_, _ = w.Write([]byte(resp))
 	})
 
 	srv := &http.Server{
@@ -82,5 +100,6 @@ func main() {
 		logger.Error("Server forced to shutdown", "error", err)
 	}
 
+	mon.Stop()
 	logger.Info("NetFusion server stopped cleanly")
 }

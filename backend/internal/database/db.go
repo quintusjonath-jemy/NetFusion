@@ -29,7 +29,6 @@ func New(cfg *config.Config, logger *slog.Logger) (*DB, error) {
 	driver := strings.ToLower(cfg.DBDriver)
 	dsn := cfg.DBURL
 
-	// If driver is postgres, attempt connection; if unreachable, log and allow graceful fallback to sqlite
 	var conn *sql.DB
 	var err error
 
@@ -98,270 +97,194 @@ func (d *DB) Driver() string {
 	return d.driver
 }
 
+// parseDBTime parses diverse timestamp formats returned by PostgreSQL or SQLite
+func parseDBTime(val any) (time.Time, bool) {
+	if val == nil {
+		return time.Time{}, false
+	}
+	switch v := val.(type) {
+	case time.Time:
+		return v, true
+	case *time.Time:
+		if v == nil {
+			return time.Time{}, false
+		}
+		return *v, true
+	case string:
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return time.Time{}, false
+		}
+		layouts := []string{
+			time.RFC3339Nano,
+			time.RFC3339,
+			"2006-01-02 15:04:05.999999999-07:00",
+			"2006-01-02 15:04:05.999999999",
+			"2006-01-02 15:04:05-07:00",
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05",
+		}
+		for _, layout := range layouts {
+			if t, err := time.Parse(layout, v); err == nil {
+				return t, true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+// formatQuery converts PostgreSQL $N parameter placeholders to ? or ?N for SQLite
+func (d *DB) formatQuery(query string, paramCount int) string {
+	if d.driver != "sqlite" {
+		return query
+	}
+	formatted := query
+	for i := paramCount; i >= 1; i-- {
+		formatted = strings.ReplaceAll(formatted, fmt.Sprintf("$%d", i), fmt.Sprintf("?%d", i))
+	}
+	return formatted
+}
+
 // migrate executes the initial schema
 func (d *DB) migrate() error {
-	var schemaSQL string
+	idType := "BIGSERIAL"
+	if d.driver == "sqlite" {
+		idType = "INTEGER PRIMARY KEY AUTOINCREMENT"
+	}
+
+	schemaSQL := fmt.Sprintf(`
+	CREATE TABLE IF NOT EXISTS network_interfaces (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL UNIQUE,
+		type TEXT NOT NULL,
+		ip_address TEXT,
+		mac_address TEXT,
+		gateway TEXT,
+		subnet TEXT,
+		status TEXT NOT NULL DEFAULT 'connected',
+		carrier BOOLEAN DEFAULT true,
+		mtu INTEGER DEFAULT 1500,
+		signal_strength INTEGER DEFAULT 100,
+		rx_bytes BIGINT DEFAULT 0,
+		tx_bytes BIGINT DEFAULT 0,
+		total_data_used_bytes BIGINT DEFAULT 0,
+		current_download_mbps REAL DEFAULT 0.0,
+		current_upload_mbps REAL DEFAULT 0.0,
+		latency_ms REAL DEFAULT 0.0,
+		packet_loss REAL DEFAULT 0.0,
+		jitter_ms REAL DEFAULT 0.0,
+		stability_score REAL DEFAULT 100.0,
+		dynamic_score REAL DEFAULT 0.0,
+		allocated_weight_pct REAL DEFAULT 0.0,
+		is_default BOOLEAN DEFAULT false,
+		is_simulated BOOLEAN DEFAULT false,
+		uptime_seconds BIGINT DEFAULT 0,
+		updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS network_metrics (
+		id %s,
+		interface_id TEXT NOT NULL,
+		interface_name TEXT NOT NULL,
+		download_mbps REAL DEFAULT 0.0,
+		upload_mbps REAL DEFAULT 0.0,
+		latency_ms REAL DEFAULT 0.0,
+		packet_loss REAL DEFAULT 0.0,
+		jitter_ms REAL DEFAULT 0.0,
+		dynamic_score REAL DEFAULT 0.0,
+		timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_metrics_iface_time ON network_metrics(interface_name, timestamp DESC);
+	CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON network_metrics(timestamp DESC);
+
+	CREATE TABLE IF NOT EXISTS traffic_sessions (
+		id TEXT PRIMARY KEY,
+		start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		end_time TIMESTAMP,
+		mode TEXT NOT NULL,
+		total_bytes BIGINT DEFAULT 0,
+		bytes_per_interface TEXT DEFAULT '{}'
+	);
+
+	CREATE TABLE IF NOT EXISTS download_sessions (
+		id TEXT PRIMARY KEY,
+		url TEXT NOT NULL,
+		file_name TEXT NOT NULL,
+		file_size BIGINT DEFAULT 0,
+		downloaded_bytes BIGINT DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'queued',
+		mode TEXT NOT NULL DEFAULT 'multi',
+		selected_interface TEXT,
+		speed_mbps REAL DEFAULT 0.0,
+		progress_pct REAL DEFAULT 0.0,
+		eta_seconds BIGINT DEFAULT 0,
+		active_paths INTEGER DEFAULT 1,
+		interface_contributions TEXT DEFAULT '{}',
+		error_message TEXT,
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		completed_at TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS network_events (
+		id TEXT PRIMARY KEY,
+		type TEXT NOT NULL,
+		interface_name TEXT,
+		severity TEXT NOT NULL DEFAULT 'info',
+		message TEXT NOT NULL,
+		metadata TEXT DEFAULT '{}',
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_events_created_at ON network_events(created_at DESC);
+
+	CREATE TABLE IF NOT EXISTS policies (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		mode TEXT NOT NULL,
+		weights TEXT NOT NULL,
+		interface_priorities TEXT NOT NULL DEFAULT '{}',
+		data_limits_mb TEXT NOT NULL DEFAULT '{}',
+		failover_enabled BOOLEAN DEFAULT true,
+		auto_recovery_enabled BOOLEAN DEFAULT true,
+		degraded_threshold_latency_ms REAL DEFAULT 150.0,
+		degraded_threshold_loss_pct REAL DEFAULT 5.0,
+		is_active BOOLEAN DEFAULT false,
+		updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS benchmarks (
+		id TEXT PRIMARY KEY,
+		test_name TEXT NOT NULL,
+		url TEXT NOT NULL,
+		duration_seconds INTEGER DEFAULT 0,
+		single_interface_name TEXT NOT NULL,
+		single_mbps REAL DEFAULT 0.0,
+		multi_mbps REAL DEFAULT 0.0,
+		improvement_pct REAL DEFAULT 0.0,
+		single_latency_avg REAL DEFAULT 0.0,
+		multi_latency_avg REAL DEFAULT 0.0,
+		single_packet_loss REAL DEFAULT 0.0,
+		multi_packet_loss REAL DEFAULT 0.0,
+		failover_recovery_time_ms BIGINT DEFAULT 0,
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS system_settings (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		simulation_mode BOOLEAN DEFAULT false,
+		telemetry_interval_ms INTEGER DEFAULT 1000,
+		retention_days INTEGER DEFAULT 7,
+		log_level TEXT DEFAULT 'INFO',
+		mptcp_enabled BOOLEAN DEFAULT true,
+		active_policy_id TEXT,
+		updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	`, idType)
 
 	if d.driver == "postgres" {
-		schemaSQL = `
-		CREATE TABLE IF NOT EXISTS network_interfaces (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL UNIQUE,
-			type TEXT NOT NULL,
-			ip_address TEXT,
-			mac_address TEXT,
-			gateway TEXT,
-			subnet TEXT,
-			status TEXT NOT NULL DEFAULT 'connected',
-			carrier BOOLEAN DEFAULT true,
-			mtu INTEGER DEFAULT 1500,
-			signal_strength INTEGER DEFAULT 100,
-			rx_bytes BIGINT DEFAULT 0,
-			tx_bytes BIGINT DEFAULT 0,
-			total_data_used_bytes BIGINT DEFAULT 0,
-			current_download_mbps REAL DEFAULT 0.0,
-			current_upload_mbps REAL DEFAULT 0.0,
-			latency_ms REAL DEFAULT 0.0,
-			packet_loss REAL DEFAULT 0.0,
-			jitter_ms REAL DEFAULT 0.0,
-			stability_score REAL DEFAULT 100.0,
-			dynamic_score REAL DEFAULT 0.0,
-			allocated_weight_pct REAL DEFAULT 0.0,
-			is_default BOOLEAN DEFAULT false,
-			is_simulated BOOLEAN DEFAULT false,
-			uptime_seconds BIGINT DEFAULT 0,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
-		CREATE TABLE IF NOT EXISTS network_metrics (
-			id BIGSERIAL PRIMARY KEY,
-			interface_id TEXT NOT NULL,
-			interface_name TEXT NOT NULL,
-			download_mbps REAL DEFAULT 0.0,
-			upload_mbps REAL DEFAULT 0.0,
-			latency_ms REAL DEFAULT 0.0,
-			packet_loss REAL DEFAULT 0.0,
-			jitter_ms REAL DEFAULT 0.0,
-			dynamic_score REAL DEFAULT 0.0,
-			timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_metrics_iface_time ON network_metrics(interface_name, timestamp DESC);
-		CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON network_metrics(timestamp DESC);
-
-		CREATE TABLE IF NOT EXISTS traffic_sessions (
-			id TEXT PRIMARY KEY,
-			start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			end_time TIMESTAMP,
-			mode TEXT NOT NULL,
-			total_bytes BIGINT DEFAULT 0,
-			bytes_per_interface TEXT DEFAULT '{}'
-		);
-
-		CREATE TABLE IF NOT EXISTS download_sessions (
-			id TEXT PRIMARY KEY,
-			url TEXT NOT NULL,
-			file_name TEXT NOT NULL,
-			file_size BIGINT DEFAULT 0,
-			downloaded_bytes BIGINT DEFAULT 0,
-			status TEXT NOT NULL DEFAULT 'queued',
-			mode TEXT NOT NULL DEFAULT 'multi',
-			selected_interface TEXT,
-			speed_mbps REAL DEFAULT 0.0,
-			progress_pct REAL DEFAULT 0.0,
-			eta_seconds BIGINT DEFAULT 0,
-			active_paths INTEGER DEFAULT 1,
-			interface_contributions TEXT DEFAULT '{}',
-			error_message TEXT,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			completed_at TIMESTAMP
-		);
-
-		CREATE TABLE IF NOT EXISTS network_events (
-			id TEXT PRIMARY KEY,
-			type TEXT NOT NULL,
-			interface_name TEXT,
-			severity TEXT NOT NULL DEFAULT 'info',
-			message TEXT NOT NULL,
-			metadata TEXT DEFAULT '{}',
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_events_created_at ON network_events(created_at DESC);
-
-		CREATE TABLE IF NOT EXISTS policies (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			mode TEXT NOT NULL,
-			weights TEXT NOT NULL,
-			interface_priorities TEXT NOT NULL DEFAULT '{}',
-			data_limits_mb TEXT NOT NULL DEFAULT '{}',
-			failover_enabled BOOLEAN DEFAULT true,
-			auto_recovery_enabled BOOLEAN DEFAULT true,
-			degraded_threshold_latency_ms REAL DEFAULT 150.0,
-			degraded_threshold_loss_pct REAL DEFAULT 5.0,
-			is_active BOOLEAN DEFAULT false,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
-		CREATE TABLE IF NOT EXISTS benchmarks (
-			id TEXT PRIMARY KEY,
-			test_name TEXT NOT NULL,
-			url TEXT NOT NULL,
-			duration_seconds INTEGER DEFAULT 0,
-			single_interface_name TEXT NOT NULL,
-			single_mbps REAL DEFAULT 0.0,
-			multi_mbps REAL DEFAULT 0.0,
-			improvement_pct REAL DEFAULT 0.0,
-			single_latency_avg REAL DEFAULT 0.0,
-			multi_latency_avg REAL DEFAULT 0.0,
-			single_packet_loss REAL DEFAULT 0.0,
-			multi_packet_loss REAL DEFAULT 0.0,
-			failover_recovery_time_ms BIGINT DEFAULT 0,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
-		CREATE TABLE IF NOT EXISTS system_settings (
-			id INTEGER PRIMARY KEY CHECK (id = 1),
-			simulation_mode BOOLEAN DEFAULT false,
-			telemetry_interval_ms INTEGER DEFAULT 1000,
-			retention_days INTEGER DEFAULT 7,
-			log_level TEXT DEFAULT 'INFO',
-			mptcp_enabled BOOLEAN DEFAULT true,
-			active_policy_id TEXT,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-		`
-	} else {
-		schemaSQL = `
-		CREATE TABLE IF NOT EXISTS network_interfaces (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL UNIQUE,
-			type TEXT NOT NULL,
-			ip_address TEXT,
-			mac_address TEXT,
-			gateway TEXT,
-			subnet TEXT,
-			status TEXT NOT NULL DEFAULT 'connected',
-			carrier BOOLEAN DEFAULT true,
-			mtu INTEGER DEFAULT 1500,
-			signal_strength INTEGER DEFAULT 100,
-			rx_bytes BIGINT DEFAULT 0,
-			tx_bytes BIGINT DEFAULT 0,
-			total_data_used_bytes BIGINT DEFAULT 0,
-			current_download_mbps REAL DEFAULT 0.0,
-			current_upload_mbps REAL DEFAULT 0.0,
-			latency_ms REAL DEFAULT 0.0,
-			packet_loss REAL DEFAULT 0.0,
-			jitter_ms REAL DEFAULT 0.0,
-			stability_score REAL DEFAULT 100.0,
-			dynamic_score REAL DEFAULT 0.0,
-			allocated_weight_pct REAL DEFAULT 0.0,
-			is_default BOOLEAN DEFAULT false,
-			is_simulated BOOLEAN DEFAULT false,
-			uptime_seconds BIGINT DEFAULT 0,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
-		CREATE TABLE IF NOT EXISTS network_metrics (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			interface_id TEXT NOT NULL,
-			interface_name TEXT NOT NULL,
-			download_mbps REAL DEFAULT 0.0,
-			upload_mbps REAL DEFAULT 0.0,
-			latency_ms REAL DEFAULT 0.0,
-			packet_loss REAL DEFAULT 0.0,
-			jitter_ms REAL DEFAULT 0.0,
-			dynamic_score REAL DEFAULT 0.0,
-			timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_metrics_iface_time ON network_metrics(interface_name, timestamp DESC);
-		CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON network_metrics(timestamp DESC);
-
-		CREATE TABLE IF NOT EXISTS traffic_sessions (
-			id TEXT PRIMARY KEY,
-			start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			end_time TIMESTAMP,
-			mode TEXT NOT NULL,
-			total_bytes BIGINT DEFAULT 0,
-			bytes_per_interface TEXT DEFAULT '{}'
-		);
-
-		CREATE TABLE IF NOT EXISTS download_sessions (
-			id TEXT PRIMARY KEY,
-			url TEXT NOT NULL,
-			file_name TEXT NOT NULL,
-			file_size BIGINT DEFAULT 0,
-			downloaded_bytes BIGINT DEFAULT 0,
-			status TEXT NOT NULL DEFAULT 'queued',
-			mode TEXT NOT NULL DEFAULT 'multi',
-			selected_interface TEXT,
-			speed_mbps REAL DEFAULT 0.0,
-			progress_pct REAL DEFAULT 0.0,
-			eta_seconds BIGINT DEFAULT 0,
-			active_paths INTEGER DEFAULT 1,
-			interface_contributions TEXT DEFAULT '{}',
-			error_message TEXT,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			completed_at TIMESTAMP
-		);
-
-		CREATE TABLE IF NOT EXISTS network_events (
-			id TEXT PRIMARY KEY,
-			type TEXT NOT NULL,
-			interface_name TEXT,
-			severity TEXT NOT NULL DEFAULT 'info',
-			message TEXT NOT NULL,
-			metadata TEXT DEFAULT '{}',
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_events_created_at ON network_events(created_at DESC);
-
-		CREATE TABLE IF NOT EXISTS policies (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			mode TEXT NOT NULL,
-			weights TEXT NOT NULL,
-			interface_priorities TEXT NOT NULL DEFAULT '{}',
-			data_limits_mb TEXT NOT NULL DEFAULT '{}',
-			failover_enabled BOOLEAN DEFAULT true,
-			auto_recovery_enabled BOOLEAN DEFAULT true,
-			degraded_threshold_latency_ms REAL DEFAULT 150.0,
-			degraded_threshold_loss_pct REAL DEFAULT 5.0,
-			is_active BOOLEAN DEFAULT false,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
-		CREATE TABLE IF NOT EXISTS benchmarks (
-			id TEXT PRIMARY KEY,
-			test_name TEXT NOT NULL,
-			url TEXT NOT NULL,
-			duration_seconds INTEGER DEFAULT 0,
-			single_interface_name TEXT NOT NULL,
-			single_mbps REAL DEFAULT 0.0,
-			multi_mbps REAL DEFAULT 0.0,
-			improvement_pct REAL DEFAULT 0.0,
-			single_latency_avg REAL DEFAULT 0.0,
-			multi_latency_avg REAL DEFAULT 0.0,
-			single_packet_loss REAL DEFAULT 0.0,
-			multi_packet_loss REAL DEFAULT 0.0,
-			failover_recovery_time_ms BIGINT DEFAULT 0,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-
-		CREATE TABLE IF NOT EXISTS system_settings (
-			id INTEGER PRIMARY KEY CHECK (id = 1),
-			simulation_mode BOOLEAN DEFAULT false,
-			telemetry_interval_ms INTEGER DEFAULT 1000,
-			retention_days INTEGER DEFAULT 7,
-			log_level TEXT DEFAULT 'INFO',
-			mptcp_enabled BOOLEAN DEFAULT true,
-			active_policy_id TEXT,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-		`
+		// PostgreSQL requires PRIMARY KEY constraint on BIGSERIAL column if not inline
+		schemaSQL = strings.Replace(schemaSQL, "id BIGSERIAL,", "id BIGSERIAL PRIMARY KEY,", 1)
 	}
 
 	_, err := d.conn.Exec(schemaSQL)
@@ -482,11 +405,15 @@ func (d *DB) seedDefaults() error {
 	return nil
 }
 
-// SavePolicy inserts or updates a policy
+// SavePolicy inserts or updates a policy. If p.IsActive is true, deactivates all other policies.
 func (d *DB) SavePolicy(p *models.Policy) error {
 	weightsJSON, _ := json.Marshal(p.Weights)
 	prioritiesJSON, _ := json.Marshal(p.InterfacePriorities)
 	limitsJSON, _ := json.Marshal(p.DataLimitsMB)
+
+	if p.IsActive {
+		_, _ = d.conn.Exec("UPDATE policies SET is_active = false")
+	}
 
 	query := `
 	INSERT INTO policies (
@@ -507,13 +434,7 @@ func (d *DB) SavePolicy(p *models.Policy) error {
 		is_active = EXCLUDED.is_active,
 		updated_at = CURRENT_TIMESTAMP;
 	`
-	if d.driver == "sqlite" {
-		query = strings.ReplaceAll(query, "$10", "?10")
-		query = strings.ReplaceAll(query, "$11", "?11")
-		for i := 9; i >= 1; i-- {
-			query = strings.ReplaceAll(query, fmt.Sprintf("$%d", i), fmt.Sprintf("?%d", i))
-		}
-	}
+	query = d.formatQuery(query, 11)
 
 	_, err := d.conn.Exec(query,
 		p.ID, p.Name, string(p.Mode), string(weightsJSON), string(prioritiesJSON), string(limitsJSON),
@@ -521,6 +442,61 @@ func (d *DB) SavePolicy(p *models.Policy) error {
 		p.DegradedThresholdLossPct, p.IsActive,
 	)
 	return err
+}
+
+// SetActivePolicy deactivates all policies and sets the given ID as active
+func (d *DB) SetActivePolicy(policyID string) error {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("UPDATE policies SET is_active = false"); err != nil {
+		return err
+	}
+
+	query := d.formatQuery("UPDATE policies SET is_active = true, updated_at = CURRENT_TIMESTAMP WHERE id = $1", 1)
+	if _, err := tx.Exec(query, policyID); err != nil {
+		return err
+	}
+
+	settingsQuery := d.formatQuery("UPDATE system_settings SET active_policy_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = 1", 1)
+	if _, err := tx.Exec(settingsQuery, policyID); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// GetActivePolicy returns the currently active policy
+func (d *DB) GetActivePolicy() (*models.Policy, error) {
+	row := d.conn.QueryRow(`SELECT id, name, mode, weights, interface_priorities, data_limits_mb,
+		failover_enabled, auto_recovery_enabled, degraded_threshold_latency_ms,
+		degraded_threshold_loss_pct, is_active, updated_at FROM policies WHERE is_active = true LIMIT 1`)
+
+	var p models.Policy
+	var modeStr string
+	var weightsRaw, prioritiesRaw, limitsRaw string
+	var updatedAtRaw any
+
+	err := row.Scan(
+		&p.ID, &p.Name, &modeStr, &weightsRaw, &prioritiesRaw, &limitsRaw,
+		&p.FailoverEnabled, &p.AutoRecoveryEnabled, &p.DegradedThresholdLatencyMs,
+		&p.DegradedThresholdLossPct, &p.IsActive, &updatedAtRaw,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	p.Mode = models.PolicyMode(modeStr)
+	_ = json.Unmarshal([]byte(weightsRaw), &p.Weights)
+	_ = json.Unmarshal([]byte(prioritiesRaw), &p.InterfacePriorities)
+	_ = json.Unmarshal([]byte(limitsRaw), &p.DataLimitsMB)
+	if t, ok := parseDBTime(updatedAtRaw); ok {
+		p.UpdatedAt = t
+	}
+	return &p, nil
 }
 
 // GetPolicies returns all policies
@@ -538,11 +514,12 @@ func (d *DB) GetPolicies() ([]models.Policy, error) {
 		var p models.Policy
 		var modeStr string
 		var weightsRaw, prioritiesRaw, limitsRaw string
+		var updatedAtRaw any
 
 		err := rows.Scan(
 			&p.ID, &p.Name, &modeStr, &weightsRaw, &prioritiesRaw, &limitsRaw,
 			&p.FailoverEnabled, &p.AutoRecoveryEnabled, &p.DegradedThresholdLatencyMs,
-			&p.DegradedThresholdLossPct, &p.IsActive, &p.UpdatedAt,
+			&p.DegradedThresholdLossPct, &p.IsActive, &updatedAtRaw,
 		)
 		if err != nil {
 			return nil, err
@@ -552,6 +529,9 @@ func (d *DB) GetPolicies() ([]models.Policy, error) {
 		_ = json.Unmarshal([]byte(weightsRaw), &p.Weights)
 		_ = json.Unmarshal([]byte(prioritiesRaw), &p.InterfacePriorities)
 		_ = json.Unmarshal([]byte(limitsRaw), &p.DataLimitsMB)
+		if t, ok := parseDBTime(updatedAtRaw); ok {
+			p.UpdatedAt = t
+		}
 		list = append(list, p)
 	}
 	return list, nil
@@ -598,11 +578,7 @@ func (d *DB) UpsertInterface(iface *models.NetworkInterface) error {
 		uptime_seconds = EXCLUDED.uptime_seconds,
 		updated_at = CURRENT_TIMESTAMP;
 	`
-	if d.driver == "sqlite" {
-		for i := 25; i >= 1; i-- {
-			query = strings.ReplaceAll(query, fmt.Sprintf("$%d", i), fmt.Sprintf("?%d", i))
-		}
-	}
+	query = d.formatQuery(query, 25)
 
 	_, err := d.conn.Exec(query,
 		iface.ID, iface.Name, string(iface.Type), iface.IPAddress, iface.MACAddress, iface.Gateway, iface.Subnet,
@@ -614,10 +590,14 @@ func (d *DB) UpsertInterface(iface *models.NetworkInterface) error {
 	return err
 }
 
-// GetInterfaces retrieves all active interfaces
+// GetInterfaces retrieves all active interfaces, safely handling NULL columns
 func (d *DB) GetInterfaces() ([]models.NetworkInterface, error) {
 	rows, err := d.conn.Query(`SELECT 
-		id, name, type, ip_address, mac_address, gateway, subnet,
+		id, name, type,
+		COALESCE(ip_address, ''),
+		COALESCE(mac_address, ''),
+		COALESCE(gateway, ''),
+		COALESCE(subnet, ''),
 		status, carrier, mtu, signal_strength, rx_bytes, tx_bytes,
 		total_data_used_bytes, current_download_mbps, current_upload_mbps,
 		latency_ms, packet_loss, jitter_ms, stability_score, dynamic_score,
@@ -632,18 +612,22 @@ func (d *DB) GetInterfaces() ([]models.NetworkInterface, error) {
 	for rows.Next() {
 		var iface models.NetworkInterface
 		var typeStr, statusStr string
+		var updatedAtRaw any
 		err := rows.Scan(
 			&iface.ID, &iface.Name, &typeStr, &iface.IPAddress, &iface.MACAddress, &iface.Gateway, &iface.Subnet,
 			&statusStr, &iface.Carrier, &iface.MTU, &iface.SignalStrength, &iface.RxBytes, &iface.TxBytes,
 			&iface.TotalDataUsedBytes, &iface.CurrentDownloadMbps, &iface.CurrentUploadMbps,
 			&iface.LatencyMs, &iface.PacketLoss, &iface.JitterMs, &iface.StabilityScore, &iface.DynamicScore,
-			&iface.AllocatedWeightPct, &iface.IsDefault, &iface.IsSimulated, &iface.UptimeSeconds, &iface.UpdatedAt,
+			&iface.AllocatedWeightPct, &iface.IsDefault, &iface.IsSimulated, &iface.UptimeSeconds, &updatedAtRaw,
 		)
 		if err != nil {
 			return nil, err
 		}
 		iface.Type = models.InterfaceType(typeStr)
 		iface.Status = models.InterfaceStatus(statusStr)
+		if t, ok := parseDBTime(updatedAtRaw); ok {
+			iface.UpdatedAt = t
+		}
 		list = append(list, iface)
 	}
 	return list, nil
@@ -654,11 +638,7 @@ func (d *DB) InsertMetric(m *models.NetworkMetric) error {
 	query := `INSERT INTO network_metrics (
 		interface_id, interface_name, download_mbps, upload_mbps, latency_ms, packet_loss, jitter_ms, dynamic_score, timestamp
 	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`
-	if d.driver == "sqlite" {
-		for i := 8; i >= 1; i-- {
-			query = strings.ReplaceAll(query, fmt.Sprintf("$%d", i), fmt.Sprintf("?%d", i))
-		}
-	}
+	query = d.formatQuery(query, 8)
 	_, err := d.conn.Exec(query,
 		m.InterfaceID, m.InterfaceName, m.DownloadMbps, m.UploadMbps, m.LatencyMs, m.PacketLoss, m.JitterMs, m.DynamicScore,
 	)
@@ -669,15 +649,15 @@ func (d *DB) InsertMetric(m *models.NetworkMetric) error {
 func (d *DB) GetRecentMetrics(ifaceName string, minutes int) ([]models.NetworkMetric, error) {
 	var query string
 	if d.driver == "postgres" {
-		query = `SELECT id, interface_id, interface_name, download_mbps, upload_mbps, latency_ms, packet_loss, jitter_ms, dynamic_score, timestamp
+		query = fmt.Sprintf(`SELECT id, interface_id, interface_name, download_mbps, upload_mbps, latency_ms, packet_loss, jitter_ms, dynamic_score, timestamp
 			FROM network_metrics
-			WHERE interface_name = $1 AND timestamp >= NOW() - INTERVAL '` + fmt.Sprintf("%d minutes", minutes) + `'
-			ORDER BY timestamp ASC`
+			WHERE interface_name = $1 AND timestamp >= NOW() - INTERVAL '%d minutes'
+			ORDER BY timestamp ASC`, minutes)
 	} else {
-		query = `SELECT id, interface_id, interface_name, download_mbps, upload_mbps, latency_ms, packet_loss, jitter_ms, dynamic_score, timestamp
+		query = fmt.Sprintf(`SELECT id, interface_id, interface_name, download_mbps, upload_mbps, latency_ms, packet_loss, jitter_ms, dynamic_score, timestamp
 			FROM network_metrics
-			WHERE interface_name = ?1 AND timestamp >= datetime('now', '` + fmt.Sprintf("-%d minutes", minutes) + `')
-			ORDER BY timestamp ASC`
+			WHERE interface_name = ?1 AND timestamp >= datetime('now', '-%d minutes')
+			ORDER BY timestamp ASC`, minutes)
 	}
 
 	rows, err := d.conn.Query(query, ifaceName)
@@ -689,10 +669,14 @@ func (d *DB) GetRecentMetrics(ifaceName string, minutes int) ([]models.NetworkMe
 	var list []models.NetworkMetric
 	for rows.Next() {
 		var m models.NetworkMetric
+		var timestampRaw any
 		if err := rows.Scan(
-			&m.ID, &m.InterfaceID, &m.InterfaceName, &m.DownloadMbps, &m.UploadMbps, &m.LatencyMs, &m.PacketLoss, &m.JitterMs, &m.DynamicScore, &m.Timestamp,
+			&m.ID, &m.InterfaceID, &m.InterfaceName, &m.DownloadMbps, &m.UploadMbps, &m.LatencyMs, &m.PacketLoss, &m.JitterMs, &m.DynamicScore, &timestampRaw,
 		); err != nil {
 			return nil, err
+		}
+		if t, ok := parseDBTime(timestampRaw); ok {
+			m.Timestamp = t
 		}
 		list = append(list, m)
 	}
@@ -703,21 +687,17 @@ func (d *DB) GetRecentMetrics(ifaceName string, minutes int) ([]models.NetworkMe
 func (d *DB) InsertEvent(evt *models.NetworkEvent) error {
 	query := `INSERT INTO network_events (id, type, interface_name, severity, message, metadata, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`
-	if d.driver == "sqlite" {
-		for i := 6; i >= 1; i-- {
-			query = strings.ReplaceAll(query, fmt.Sprintf("$%d", i), fmt.Sprintf("?%d", i))
-		}
-	}
+	query = d.formatQuery(query, 6)
 	_, err := d.conn.Exec(query, evt.ID, evt.Type, evt.InterfaceName, string(evt.Severity), evt.Message, evt.Metadata)
 	return err
 }
 
-// GetEvents retrieves recent network events
+// GetEvents retrieves recent network events, safely handling NULL interface_name or metadata
 func (d *DB) GetEvents(limit int) ([]models.NetworkEvent, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	query := fmt.Sprintf(`SELECT id, type, interface_name, severity, message, metadata, created_at
+	query := fmt.Sprintf(`SELECT id, type, COALESCE(interface_name, ''), severity, message, COALESCE(metadata, '{}'), created_at
 		FROM network_events ORDER BY created_at DESC LIMIT %d`, limit)
 
 	rows, err := d.conn.Query(query)
@@ -730,10 +710,14 @@ func (d *DB) GetEvents(limit int) ([]models.NetworkEvent, error) {
 	for rows.Next() {
 		var evt models.NetworkEvent
 		var sev string
-		if err := rows.Scan(&evt.ID, &evt.Type, &evt.InterfaceName, &sev, &evt.Message, &evt.Metadata, &evt.CreatedAt); err != nil {
+		var createdAtRaw any
+		if err := rows.Scan(&evt.ID, &evt.Type, &evt.InterfaceName, &sev, &evt.Message, &evt.Metadata, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		evt.Severity = models.EventSeverity(sev)
+		if t, ok := parseDBTime(createdAtRaw); ok {
+			evt.CreatedAt = t
+		}
 		list = append(list, evt)
 	}
 	return list, nil
@@ -742,6 +726,11 @@ func (d *DB) GetEvents(limit int) ([]models.NetworkEvent, error) {
 // SaveDownloadSession creates or updates a download session
 func (d *DB) SaveDownloadSession(ds *models.DownloadSession) error {
 	contribJSON, _ := json.Marshal(ds.InterfaceContributions)
+	createdAt := ds.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+
 	query := `INSERT INTO download_sessions (
 		id, url, file_name, file_size, downloaded_bytes, status, mode, selected_interface,
 		speed_mbps, progress_pct, eta_seconds, active_paths, interface_contributions, error_message, created_at, completed_at
@@ -758,26 +747,26 @@ func (d *DB) SaveDownloadSession(ds *models.DownloadSession) error {
 		error_message = EXCLUDED.error_message,
 		completed_at = EXCLUDED.completed_at;`
 
-	if d.driver == "sqlite" {
-		for i := 16; i >= 1; i-- {
-			query = strings.ReplaceAll(query, fmt.Sprintf("$%d", i), fmt.Sprintf("?%d", i))
-		}
-	}
+	query = d.formatQuery(query, 16)
 
 	_, err := d.conn.Exec(query,
 		ds.ID, ds.URL, ds.FileName, ds.FileSize, ds.DownloadedBytes, string(ds.Status), ds.Mode, ds.SelectedInterface,
-		ds.SpeedMbps, ds.ProgressPct, ds.ETASeconds, ds.ActivePaths, string(contribJSON), ds.ErrorMessage, ds.CreatedAt, ds.CompletedAt,
+		ds.SpeedMbps, ds.ProgressPct, ds.ETASeconds, ds.ActivePaths, string(contribJSON), ds.ErrorMessage, createdAt, ds.CompletedAt,
 	)
 	return err
 }
 
-// GetDownloadSessions returns past downloads
+// GetDownloadSessions returns past downloads, safely handling NULL optional columns
 func (d *DB) GetDownloadSessions(limit int) ([]models.DownloadSession, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	query := fmt.Sprintf(`SELECT id, url, file_name, file_size, downloaded_bytes, status, mode, selected_interface,
-		speed_mbps, progress_pct, eta_seconds, active_paths, interface_contributions, error_message, created_at, completed_at
+	query := fmt.Sprintf(`SELECT id, url, file_name, file_size, downloaded_bytes, status, mode,
+		COALESCE(selected_interface, ''),
+		speed_mbps, progress_pct, eta_seconds, active_paths,
+		COALESCE(interface_contributions, '{}'),
+		COALESCE(error_message, ''),
+		created_at, completed_at
 		FROM download_sessions ORDER BY created_at DESC LIMIT %d`, limit)
 
 	rows, err := d.conn.Query(query)
@@ -791,14 +780,22 @@ func (d *DB) GetDownloadSessions(limit int) ([]models.DownloadSession, error) {
 		var ds models.DownloadSession
 		var statusStr string
 		var contribRaw string
+		var createdAtRaw, completedAtRaw any
 		if err := rows.Scan(
 			&ds.ID, &ds.URL, &ds.FileName, &ds.FileSize, &ds.DownloadedBytes, &statusStr, &ds.Mode, &ds.SelectedInterface,
-			&ds.SpeedMbps, &ds.ProgressPct, &ds.ETASeconds, &ds.ActivePaths, &contribRaw, &ds.ErrorMessage, &ds.CreatedAt, &ds.CompletedAt,
+			&ds.SpeedMbps, &ds.ProgressPct, &ds.ETASeconds, &ds.ActivePaths, &contribRaw, &ds.ErrorMessage,
+			&createdAtRaw, &completedAtRaw,
 		); err != nil {
 			return nil, err
 		}
 		ds.Status = models.DownloadStatus(statusStr)
 		_ = json.Unmarshal([]byte(contribRaw), &ds.InterfaceContributions)
+		if t, ok := parseDBTime(createdAtRaw); ok {
+			ds.CreatedAt = t
+		}
+		if t, ok := parseDBTime(completedAtRaw); ok {
+			ds.CompletedAt = &t
+		}
 		list = append(list, ds)
 	}
 	return list, nil
@@ -811,11 +808,8 @@ func (d *DB) SaveBenchmark(b *models.BenchmarkResult) error {
 		improvement_pct, single_latency_avg, multi_latency_avg, single_packet_loss, multi_packet_loss,
 		failover_recovery_time_ms, created_at
 	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)`
-	if d.driver == "sqlite" {
-		for i := 13; i >= 1; i-- {
-			query = strings.ReplaceAll(query, fmt.Sprintf("$%d", i), fmt.Sprintf("?%d", i))
-		}
-	}
+	query = d.formatQuery(query, 13)
+
 	_, err := d.conn.Exec(query,
 		b.ID, b.TestName, b.URL, b.DurationSeconds, b.SingleInterfaceName, b.SingleMbps, b.MultiMbps,
 		b.ImprovementPct, b.SingleLatencyAvg, b.MultiLatencyAvg, b.SinglePacketLoss, b.MultiPacketLoss,
@@ -837,26 +831,35 @@ func (d *DB) GetBenchmarks() ([]models.BenchmarkResult, error) {
 	var list []models.BenchmarkResult
 	for rows.Next() {
 		var b models.BenchmarkResult
+		var createdAtRaw any
 		if err := rows.Scan(
 			&b.ID, &b.TestName, &b.URL, &b.DurationSeconds, &b.SingleInterfaceName, &b.SingleMbps, &b.MultiMbps,
 			&b.ImprovementPct, &b.SingleLatencyAvg, &b.MultiLatencyAvg, &b.SinglePacketLoss, &b.MultiPacketLoss,
-			&b.FailoverRecoveryTimeMs, &b.CreatedAt,
+			&b.FailoverRecoveryTimeMs, &createdAtRaw,
 		); err != nil {
 			return nil, err
+		}
+		if t, ok := parseDBTime(createdAtRaw); ok {
+			b.CreatedAt = t
 		}
 		list = append(list, b)
 	}
 	return list, nil
 }
 
-// GetSettings loads the current settings
+// GetSettings loads the current settings, safely handling NULL active_policy_id
 func (d *DB) GetSettings() (*models.SystemSettings, error) {
-	row := d.conn.QueryRow(`SELECT simulation_mode, telemetry_interval_ms, retention_days, log_level, mptcp_enabled, active_policy_id, updated_at
+	row := d.conn.QueryRow(`SELECT simulation_mode, telemetry_interval_ms, retention_days, log_level, mptcp_enabled,
+		COALESCE(active_policy_id, ''), updated_at
 		FROM system_settings WHERE id = 1`)
 	var s models.SystemSettings
-	err := row.Scan(&s.SimulationMode, &s.TelemetryInterval, &s.RetentionDays, &s.LogLevel, &s.MPTCPEnabled, &s.ActivePolicyID, &s.UpdatedAt)
+	var updatedAtRaw any
+	err := row.Scan(&s.SimulationMode, &s.TelemetryInterval, &s.RetentionDays, &s.LogLevel, &s.MPTCPEnabled, &s.ActivePolicyID, &updatedAtRaw)
 	if err != nil {
 		return nil, err
+	}
+	if t, ok := parseDBTime(updatedAtRaw); ok {
+		s.UpdatedAt = t
 	}
 	return &s, nil
 }
@@ -872,17 +875,17 @@ func (d *DB) UpdateSettings(s *models.SystemSettings) error {
 		active_policy_id = $6,
 		updated_at = CURRENT_TIMESTAMP
 		WHERE id = 1`
-	if d.driver == "sqlite" {
-		for i := 6; i >= 1; i-- {
-			query = strings.ReplaceAll(query, fmt.Sprintf("$%d", i), fmt.Sprintf("?%d", i))
-		}
-	}
+	query = d.formatQuery(query, 6)
 	_, err := d.conn.Exec(query, s.SimulationMode, s.TelemetryInterval, s.RetentionDays, s.LogLevel, s.MPTCPEnabled, s.ActivePolicyID)
 	return err
 }
 
-// PruneOldMetrics deletes metrics older than retention days
+// PruneOldMetrics deletes metrics older than retention days with safe validation
 func (d *DB) PruneOldMetrics(retentionDays int) (int64, error) {
+	if retentionDays <= 0 {
+		return 0, nil
+	}
+
 	var query string
 	if d.driver == "postgres" {
 		query = fmt.Sprintf("DELETE FROM network_metrics WHERE timestamp < NOW() - INTERVAL '%d days'", retentionDays)
