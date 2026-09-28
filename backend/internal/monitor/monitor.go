@@ -11,6 +11,7 @@ import (
 
 	"netfusion/backend/internal/config"
 	"netfusion/backend/internal/database"
+	"netfusion/backend/internal/decision"
 	"netfusion/backend/internal/models"
 	"netfusion/backend/internal/network"
 	"netfusion/backend/internal/simulation"
@@ -18,38 +19,61 @@ import (
 
 // Monitor orchestrates network discovery, active probing, simulation, and event detection
 type Monitor struct {
-	mu             sync.RWMutex
-	cfg            *config.Config
-	db             *database.DB
-	logger         *slog.Logger
-	discovery      *network.Discovery
-	prober         *network.InterfaceProber
-	simulator      *simulation.Simulator
-	mptcpStatus    network.MPTCPStatus
-	interfaces     map[string]models.NetworkInterface
-	previousStatus map[string]models.InterfaceStatus
-	simulationMode bool
-	interval       time.Duration
-	stopChan       chan struct{}
-	running        bool
-	onUpdate       func([]models.NetworkInterface) // callback for websocket broadcasts
+	mu                  sync.RWMutex
+	cfg                 *config.Config
+	db                  *database.DB
+	logger              *slog.Logger
+	discovery           *network.Discovery
+	prober              *network.InterfaceProber
+	simulator           *simulation.Simulator
+	decisionEngine      *decision.DecisionEngine
+	mptcpStatus         network.MPTCPStatus
+	interfaces          map[string]models.NetworkInterface
+	trafficDistribution []models.TrafficDistributionEntry
+	previousStatus      map[string]models.InterfaceStatus
+	simulationMode      bool
+	interval            time.Duration
+	stopChan            chan struct{}
+	running             bool
+	onUpdate            func([]models.NetworkInterface) // callback for websocket broadcasts
 }
 
 // New creates a new telemetry Monitor
 func New(cfg *config.Config, db *database.DB, logger *slog.Logger) *Monitor {
 	m := &Monitor{
 		cfg:            cfg,
-		db:             db,
-		logger:         logger,
-		discovery:      network.NewDiscovery(),
-		prober:         network.NewInterfaceProber(),
-		simulator:      simulation.NewSimulator(),
-		interfaces:     make(map[string]models.NetworkInterface),
-		previousStatus: make(map[string]models.InterfaceStatus),
-		simulationMode: cfg.SimulationMode,
-		interval:       cfg.TelemetryInterval,
-		stopChan:       make(chan struct{}),
+		db:                  db,
+		logger:              logger,
+		discovery:           network.NewDiscovery(),
+		prober:              network.NewInterfaceProber(),
+		simulator:           simulation.NewSimulator(),
+		interfaces:          make(map[string]models.NetworkInterface),
+		trafficDistribution: make([]models.TrafficDistributionEntry, 0),
+		previousStatus:      make(map[string]models.InterfaceStatus),
+		simulationMode:      cfg.SimulationMode,
+		interval:            cfg.TelemetryInterval,
+		stopChan:            make(chan struct{}),
 	}
+
+	// Load active policy or fall back to default balanced policy
+	activePolicy, err := db.GetActivePolicy()
+	if err != nil || activePolicy == nil {
+		activePolicy = &models.Policy{
+			ID:   "policy-balanced",
+			Name: "Balanced Adaptive Mode",
+			Mode: models.PolicyBalanced,
+			Weights: models.PolicyWeights{
+				BandwidthWeight:   0.40,
+				LatencyWeight:     0.30,
+				StabilityWeight:   0.15,
+				ReliabilityWeight: 0.15,
+				CostPenalty:       0.10,
+			},
+			FailoverEnabled:     true,
+			AutoRecoveryEnabled: true,
+		}
+	}
+	m.decisionEngine = decision.NewDecisionEngine(*activePolicy)
 
 	// Initial MPTCP check
 	m.mptcpStatus = network.CheckMPTCPStatus()
@@ -169,6 +193,22 @@ func (m *Monitor) tick() {
 			}
 		}
 		wg.Wait()
+	}
+
+	// 2. Evaluate Dynamic Scoring and Traffic Allocation via Decision Engine
+	evalResult := m.decisionEngine.Evaluate(currentInterfaces)
+	currentInterfaces = evalResult.Interfaces
+
+	m.mu.Lock()
+	m.trafficDistribution = evalResult.Distribution
+	m.mu.Unlock()
+
+	// Persist failover or rebalance events triggered by decision engine
+	for _, evt := range evalResult.Events {
+		m.logger.Info("Decision engine event", "type", evt.Type, "interface", evt.InterfaceName, "message", evt.Message)
+		if err := m.db.InsertEvent(&evt); err != nil {
+			m.logger.Warn("Failed to persist decision engine event", "error", err)
+		}
 	}
 
 	// Update MPTCP status periodically
@@ -327,4 +367,44 @@ func (m *Monitor) SetSimulationMode(enabled bool) {
 // Simulator returns the simulator instance for chaos control
 func (m *Monitor) Simulator() *simulation.Simulator {
 	return m.simulator
+}
+
+// DecisionEngine returns the active decision engine
+func (m *Monitor) DecisionEngine() *decision.DecisionEngine {
+	return m.decisionEngine
+}
+
+// GetTrafficDistribution returns current allocated traffic distribution
+func (m *Monitor) GetTrafficDistribution() []models.TrafficDistributionEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	dist := make([]models.TrafficDistributionEntry, len(m.trafficDistribution))
+	copy(dist, m.trafficDistribution)
+	return dist
+}
+
+// SetActivePolicy applies and persists a new traffic policy
+func (m *Monitor) SetActivePolicy(policy models.Policy) error {
+	policy.IsActive = true
+	if err := m.db.SavePolicy(&policy); err != nil {
+		return err
+	}
+	if err := m.db.SetActivePolicy(policy.ID); err != nil {
+		return err
+	}
+
+	m.decisionEngine.SetPolicy(policy)
+	m.logger.Info("Active traffic policy updated", "policy", policy.Name, "mode", policy.Mode)
+
+	m.recordEvent(
+		"policy_change",
+		"",
+		models.SeverityInfo,
+		fmt.Sprintf("Traffic allocation policy updated to '%s' (Mode: %s)", policy.Name, policy.Mode),
+	)
+
+	// Trigger immediate tick to rebalance traffic
+	m.tick()
+	return nil
 }
