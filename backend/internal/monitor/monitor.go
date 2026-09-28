@@ -140,22 +140,27 @@ func (m *Monitor) tick() {
 			return
 		}
 
-		// Perform active interface-bound probing
+		// Perform active interface-bound probing concurrently across all interfaces
+		var wg sync.WaitGroup
 		for i := range currentInterfaces {
 			iface := &currentInterfaces[i]
 			if iface.Carrier && iface.IPAddress != "" {
-				res := m.prober.ProbeInterface(iface.Name, iface.IPAddress, iface.Gateway)
-				iface.LatencyMs = res.LatencyMs
-				iface.PacketLoss = res.PacketLoss
-				iface.JitterMs = res.JitterMs
-				iface.StabilityScore = res.StabilityScore
+				wg.Add(1)
+				go func(inf *models.NetworkInterface) {
+					defer wg.Done()
+					res := m.prober.ProbeInterface(inf.Name, inf.IPAddress, inf.Gateway)
+					inf.LatencyMs = res.LatencyMs
+					inf.PacketLoss = res.PacketLoss
+					inf.JitterMs = res.JitterMs
+					inf.StabilityScore = res.StabilityScore
 
-				// Evaluate degraded state based on quality thresholds
-				if res.PacketLoss >= 5.0 || res.LatencyMs > 180.0 {
-					iface.Status = models.StatusDegraded
-				} else {
-					iface.Status = models.StatusConnected
-				}
+					// Evaluate degraded state based on quality thresholds
+					if res.PacketLoss >= 5.0 || res.LatencyMs > 180.0 {
+						inf.Status = models.StatusDegraded
+					} else {
+						inf.Status = models.StatusConnected
+					}
+				}(iface)
 			} else {
 				iface.Status = models.StatusDisconnected
 				iface.LatencyMs = 0.0
@@ -163,6 +168,7 @@ func (m *Monitor) tick() {
 				iface.StabilityScore = 0.0
 			}
 		}
+		wg.Wait()
 	}
 
 	// Update MPTCP status periodically
@@ -205,9 +211,9 @@ func (m *Monitor) tick() {
 	callback := m.onUpdate
 	m.mu.Unlock()
 
-	// Notify listeners (e.g. WebSocket hub)
+	// Notify listeners (e.g. WebSocket hub) asynchronously
 	if callback != nil {
-		callback(currentInterfaces)
+		go callback(currentInterfaces)
 	}
 }
 
