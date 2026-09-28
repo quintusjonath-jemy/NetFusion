@@ -33,7 +33,7 @@ func Load() *Config {
 		ServerPort:        getEnv("PORT", "8080"),
 		ServerHost:        getEnv("HOST", "0.0.0.0"),
 		DBDriver:          getEnv("DB_DRIVER", "postgres"),
-		DBURL:             getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/netfusion?sslmode=disable"),
+		DBURL:             getEnv("DATABASE_URL", "postgres://postgres:postgrespassword@localhost:5432/netfusion?sslmode=disable"),
 		DBMaxConns:        getEnvAsInt("DB_MAX_CONNS", 25),
 		SimulationMode:    getEnvAsBool("SIMULATION_MODE", false),
 		TelemetryInterval: time.Duration(getEnvAsInt("TELEMETRY_INTERVAL_MS", 1000)) * time.Millisecond,
