@@ -57,7 +57,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*DB, error) {
 		} else {
 			_ = os.MkdirAll(filepath.Dir(sqliteFile), 0755)
 		}
-		conn, err = sql.Open("sqlite", sqliteFile)
+		sqliteDSN := sqliteFile
+		if !strings.Contains(sqliteDSN, "?") {
+			sqliteDSN += "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+		}
+		conn, err = sql.Open("sqlite", sqliteDSN)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open SQLite database: %w", err)
 		}
@@ -66,9 +70,13 @@ func New(cfg *config.Config, logger *slog.Logger) (*DB, error) {
 		logger.Info("Connected to PostgreSQL database", "url", dsn)
 	}
 
-	conn.SetMaxOpenConns(cfg.DBMaxConns)
-	conn.SetMaxIdleConns(5)
-	conn.SetConnMaxLifetime(30 * time.Minute)
+	if driver == "sqlite" {
+		conn.SetMaxOpenConns(1)
+	} else {
+		conn.SetMaxOpenConns(cfg.DBMaxConns)
+		conn.SetMaxIdleConns(5)
+		conn.SetConnMaxLifetime(30 * time.Minute)
+	}
 
 	db := &DB{
 		conn:   conn,

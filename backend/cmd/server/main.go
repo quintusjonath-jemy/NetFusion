@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,9 +9,14 @@ import (
 	"syscall"
 	"time"
 
+	"netfusion/backend/internal/api"
+	"netfusion/backend/internal/benchmark"
 	"netfusion/backend/internal/config"
 	"netfusion/backend/internal/database"
+	"netfusion/backend/internal/download"
+	"netfusion/backend/internal/models"
 	"netfusion/backend/internal/monitor"
+	"netfusion/backend/internal/websocket"
 )
 
 func main() {
@@ -49,45 +53,52 @@ func main() {
 
 	logger.Info("Database ready", "driver", db.Driver())
 
-	// 4. Initialize & Start Network Telemetry Monitor
-	mon := monitor.New(cfg, db, logger)
+	// 4. Initialize WebSocket Hub
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()
+
+	wsHub := websocket.NewHub(logger)
+	go wsHub.Run(serverCtx)
+
+	// 5. Initialize Network Telemetry Monitor
+	mon := monitor.New(cfg, db, logger)
+
+	// Wire real-time telemetry streaming to WebSocket Hub
+	mon.SetOnUpdate(func(ifaces []models.NetworkInterface) {
+		wsHub.Broadcast("network_update", ifaces)
+		wsHub.Broadcast("traffic_update", mon.GetTrafficDistribution())
+	})
+
+	mon.SetOnEvent(func(evt *models.NetworkEvent) {
+		wsHub.Broadcast("network_event", evt)
+	})
+
 	mon.Start(serverCtx)
 
-	// 5. Basic healthcheck and diagnostic endpoint
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		mptcp := mon.GetMPTCPStatus()
-		ifaces := mon.GetInterfaces()
-		resp := fmt.Sprintf(`{
-			"status": "ok",
-			"component": "netfusion-backend",
-			"phase": 2,
-			"simulationMode": %v,
-			"interfacesCount": %d,
-			"mptcpEnabled": %v
-		}`, mon.IsSimulationMode(), len(ifaces), mptcp.Enabled)
-		_, _ = w.Write([]byte(resp))
-	})
+	// 6. Initialize Multi-Network Downloader & Benchmark Runner
+	downloader := download.NewDownloader(db, mon, wsHub, logger)
+	benchRunner := benchmark.NewBenchmarkRunner(db, mon, downloader, wsHub, logger)
+
+	// 7. Initialize API Server and Router
+	server := api.NewServer(db, mon, downloader, benchRunner, wsHub)
+	router := server.SetupRouter()
 
 	srv := &http.Server{
 		Addr:         cfg.ServerHost + ":" + cfg.ServerPort,
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Handler:      router,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {
-		logger.Info("Server listening", "address", srv.Addr)
+		logger.Info("NetFusion HTTP and WebSocket Server listening", "address", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("HTTP server failed", "error", err)
 		}
 	}()
 
-	// 5. Graceful shutdown
+	// 8. Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit

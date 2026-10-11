@@ -36,6 +36,7 @@ type Monitor struct {
 	stopChan            chan struct{}
 	running             bool
 	onUpdate            func([]models.NetworkInterface) // callback for websocket broadcasts
+	onEvent             func(*models.NetworkEvent)      // callback for realtime event broadcasts
 }
 
 // New creates a new telemetry Monitor
@@ -124,6 +125,13 @@ func (m *Monitor) SetOnUpdate(fn func([]models.NetworkInterface)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onUpdate = fn
+}
+
+// SetOnEvent sets the callback for when network events are detected
+func (m *Monitor) SetOnEvent(fn func(*models.NetworkEvent)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onEvent = fn
 }
 
 // run is the background ticker loop
@@ -320,6 +328,13 @@ func (m *Monitor) recordEvent(eventType, ifaceName string, severity models.Event
 	m.logger.Info("Network event detected", "type", eventType, "interface", ifaceName, "severity", severity, "message", message)
 	if err := m.db.InsertEvent(evt); err != nil {
 		m.logger.Warn("Failed to persist network event", "error", err)
+	}
+
+	m.mu.RLock()
+	evtCb := m.onEvent
+	m.mu.RUnlock()
+	if evtCb != nil {
+		go evtCb(evt)
 	}
 }
 
