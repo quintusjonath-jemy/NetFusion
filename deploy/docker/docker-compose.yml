@@ -20,6 +20,39 @@ services:
       timeout: 5s
       retries: 5
 
+  backend:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/backend.Dockerfile
+    container_name: netfusion-backend
+    restart: unless-stopped
+    # Use host network mode and NET_ADMIN to bind to physical interfaces and inspect Linux MPTCP
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      DB_DRIVER: "postgres"
+      DATABASE_URL: "postgres://postgres:postgrespassword@127.0.0.1:5432/netfusion?sslmode=disable"
+      SIMULATION_MODE: "false"
+      LOG_LEVEL: "INFO"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/frontend.Dockerfile
+    container_name: netfusion-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
 volumes:
   postgres_data:
     driver: local

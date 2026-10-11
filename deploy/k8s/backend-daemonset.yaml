@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: netfusion-backend
+  namespace: default
+  labels:
+    app.kubernetes.io/name: netfusion-backend
+    app.kubernetes.io/part-of: netfusion
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: netfusion-backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: netfusion-backend
+    spec:
+      # Host network mode is REQUIRED for Linux multi-interface discovery and native MPTCP binding
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: netfusion-controller
+          image: netfusion/backend:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            # NET_ADMIN and NET_RAW are REQUIRED for SO_BINDTODEVICE and Linux MPTCP socket control
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8080"
+            - name: SIMULATION_MODE
+              value: "false"
+            - name: DB_DRIVER
+              value: "postgres"
+            - name: DATABASE_URL
+              value: "postgres://postgres:postgrespassword@netfusion-postgres.default.svc.cluster.local:5432/netfusion?sslmode=disable"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: TELEMETRY_INTERVAL_MS
+              value: "1000"
+          ports:
+            - containerPort: 8080
+              name: http-telemetry
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: host-sys-net
+              mountPath: /host/sys/class/net
+              readOnly: true
+      volumes:
+        - name: host-proc
+          hostPath:
+            path: /proc
+        - name: host-sys-net
+          hostPath:
+            path: /sys/class/net
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: netfusion-backend
+  namespace: default
+  labels:
+    app.kubernetes.io/name: netfusion-backend
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+  selector:
+    app.kubernetes.io/name: netfusion-backend
