@@ -1,6 +1,16 @@
-# Environment variables & secrets
+# ==============================================================================
+# NetFusion — Git Ignore Rules
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Environment Variables & Secrets (CRITICAL: NEVER COMMIT)
+# ------------------------------------------------------------------------------
 .env
 .env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 !.env.example
 *.pem
 *.key
@@ -12,8 +22,11 @@
 id_rsa*
 credentials.json
 secrets/
+*.secret
 
-# Database files & local storage
+# ------------------------------------------------------------------------------
+# 2. Database Files & Persistent Volumes
+# ------------------------------------------------------------------------------
 *.db
 *.db-journal
 *.db-wal
@@ -24,47 +37,84 @@ data/
 backend/data/
 backend/internal/database/data/
 postgres_data/
+*.rdb
 
-# Application & system logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# Go build & test artifacts
-backend/bin/
-backend/server
-backend/netfusion
-*.test
-*.out
-cover.out
-
-# Frontend dependencies & build outputs
-node_modules/
-frontend/node_modules/
-dist/
-frontend/dist/
-build/
-frontend/build/
-.vite/
-frontend/.vite/
-
-# Temporary files & download buffers
+# ------------------------------------------------------------------------------
+# 3. Download Buffers & Temporary Chunks
+# ------------------------------------------------------------------------------
 downloads/
 backend/downloads/
+frontend/downloads/
 tmp/
 temp/
 scratch/
 *.iso
 *.bin
 *.part
+*.crdownload
+*.download
+*.img
 
-# Operating System & IDE files
+# ------------------------------------------------------------------------------
+# 4. Go Build Artifacts & Test Outputs
+# ------------------------------------------------------------------------------
+backend/bin/
+backend/server
+backend/netfusion
+server
+netfusion
+netfusion-server
+*.test
+*.out
+*.cov
+coverage/
+cover.out
+c.out
+__debug_bin*
+
+# ------------------------------------------------------------------------------
+# 5. Frontend Dependencies & Build Outputs
+# ------------------------------------------------------------------------------
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+build/
+frontend/build/
+dist-ssr/
+frontend/dist-ssr/
+.vite/
+frontend/.vite/
+
+# ------------------------------------------------------------------------------
+# 6. Application Logs & Debug Files
+# ------------------------------------------------------------------------------
+*.log
+logs/
+backend/logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ------------------------------------------------------------------------------
+# 7. Operating System & Editor Metadata
+# ------------------------------------------------------------------------------
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 .idea/
 .vscode/
+*.sublime-workspace
+*.sublime-project
 *.swp
 *.swo
 *~
+*.bak
+*.pid
+*.sock

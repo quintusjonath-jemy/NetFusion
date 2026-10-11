@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: netfusion-postgres
+  namespace: default
+  labels:
+    app.kubernetes.io/name: netfusion-postgres
+spec:
+  serviceName: netfusion-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: netfusion-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: netfusion-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              value: "postgrespassword"
+            - name: POSTGRES_DB
+              value: "netfusion"
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "netfusion"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "netfusion"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: netfusion-postgres
+  namespace: default
+  labels:
+    app.kubernetes.io/name: netfusion-postgres
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    app.kubernetes.io/name: netfusion-postgres
